@@ -45,6 +45,11 @@ class RealSenseCameraConfig(CameraConfig):
         use_depth: Whether to enable depth stream. Defaults to False.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
+        exposure_us: Manual exposure time in microseconds for the color sensor. If set,
+            auto-exposure is disabled and the fixed exposure is applied. Must be shorter
+            than the frame period (e.g. < 33333 us at 30 fps) to keep the requested fps.
+            Defaults to 15000 (locked manual exposure); set explicitly via config to
+            adjust brightness, or set to None to restore the camera's auto-exposure.
 
     Note:
         - Either name or serial_number must be specified.
@@ -58,6 +63,7 @@ class RealSenseCameraConfig(CameraConfig):
     use_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
+    exposure_us: int | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)

@@ -220,9 +220,13 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    original_action: Action | None = None
 
     def get_action(self):
         return self.action
+
+    def get_original_action(self):
+        return self.original_action
 
 
 @dataclass
@@ -270,6 +274,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    rtc_config: Any | None = None
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

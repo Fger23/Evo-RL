@@ -631,6 +631,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def sample_delay(self, bsize, max_delay, device):
+        delay = torch.randint(max_delay, (bsize,))
+        return delay.to(dtype=torch.float32, device=device)
+
     def embed_prefix(
         self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -729,9 +733,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        if self.config.action_conditioning:
+            delay = self.sample_delay(actions.shape[0], self.config.max_delay, actions.device)
+            prefix_mask = torch.arange(
+                actions.shape[1], dtype=torch.float32, device=actions.device
+            )[None, :] < delay[:, None]
+            time_expanded = torch.where(prefix_mask, 0.0, time[:, None])[:, :, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
+
+        else:
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
@@ -773,8 +787,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        loss = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        if self.config.action_conditioning:
+            postfix_mask = torch.logical_not(prefix_mask)[:, :, None]
+            loss = torch.sum(loss * postfix_mask, dim=(1, 2)) / (torch.sum(postfix_mask, dim=(1, 2)) + 1e-8)
+        else:
+            loss = torch.mean(loss, dim=(1, 2))
+
+        return loss
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1269,7 +1290,8 @@ class PI05Policy(PreTrainedPolicy):
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            # per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = losses # already averaged over time and action dims
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:

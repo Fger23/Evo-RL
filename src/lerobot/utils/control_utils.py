@@ -21,10 +21,10 @@ import logging
 import os
 import select
 import sys
-import termios
+# import termios
 import threading
 import time
-import tty
+# import tty
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
@@ -67,98 +67,212 @@ def is_headless():
         return True
 
 
-class TTYKeyboardListener:
-    """Read control keys directly from the current TTY for SSH/headless sessions."""
+# class TTYKeyboardListener:
+#     """Read control keys directly from the current TTY for SSH/headless sessions."""
 
-    def __init__(
-        self,
+#     def __init__(
+#         self,
+#         events: dict[str, Any],
+#         intervention_toggle_key: str,
+#         episode_success_key: str | None,
+#         episode_failure_key: str | None,
+#     ):
+#         self.events = events
+#         self.intervention_toggle_key = intervention_toggle_key.lower()
+#         self.episode_success_key = episode_success_key.lower() if episode_success_key else None
+#         self.episode_failure_key = episode_failure_key.lower() if episode_failure_key else None
+#         self._fd = sys.stdin.fileno()
+#         self._stop_event = threading.Event()
+#         self._thread: threading.Thread | None = None
+#         self._old_attrs = None
+#         self._last_intervention_time: float = 0.0
+
+#     def start(self):
+#         self._old_attrs = termios.tcgetattr(self._fd)
+#         tty.setcbreak(self._fd)
+#         self._thread = threading.Thread(target=self._run, name="tty-keyboard-listener", daemon=True)
+#         self._thread.start()
+
+#     def is_alive(self) -> bool:
+#         return self._thread is not None and self._thread.is_alive()
+
+#     def stop(self):
+#         self._stop_event.set()
+#         if self._thread is not None:
+#             self._thread.join(timeout=0.5)
+#         if self._old_attrs is not None:
+#             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
+#             self._old_attrs = None
+
+#     def _run(self):
+#         while not self._stop_event.is_set():
+#             ready, _, _ = select.select([self._fd], [], [], 0.1)
+#             if not ready:
+#                 continue
+
+#             try:
+#                 key = self._read_key()
+#                 if key is not None:
+#                     self._handle_key(key)
+#             except Exception as e:
+#                 logging.warning("TTY keyboard listener stopped after read error: %s", e)
+#                 self._stop_event.set()
+
+#     def _read_key(self) -> str | None:
+#         chunk = os.read(self._fd, 1)
+#         if not chunk:
+#             return None
+
+#         if chunk == b"\x1b":
+#             sequence = bytearray(chunk)
+#             while True:
+#                 ready, _, _ = select.select([self._fd], [], [], 0.01)
+#                 if not ready:
+#                     break
+#                 sequence.extend(os.read(self._fd, 1))
+#                 last_byte = bytes(sequence[-1:])
+#                 if len(sequence) >= 3 and last_byte in {b"A", b"B", b"C", b"D", b"~"}:
+#                     break
+
+#             sequence_bytes = bytes(sequence)
+#             if sequence_bytes in {b"\x1b[C", b"\x1bOC"}:
+#                 return "RIGHT"
+#             if sequence_bytes in {b"\x1b[D", b"\x1bOD"}:
+#                 return "LEFT"
+#             if sequence_bytes == b"\x1b":
+#                 return "ESC"
+#             return None
+
+#         try:
+#             return chunk.decode("utf-8", errors="ignore")
+#         except Exception:
+#             return None
+
+#     def _handle_key(self, key: str):
+#         normalized = key.lower() if len(key) == 1 else key
+#         if normalized == "RIGHT":
+#             print("Right arrow key pressed. Exiting loop...")
+#             self.events["exit_early"] = True
+#         elif normalized == "LEFT":
+#             print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+#             self.events["rerecord_episode"] = True
+#             self.events["exit_early"] = True
+#         elif normalized == "ESC":
+#             print("Escape key pressed. Stopping data recording...")
+#             self.events["stop_recording"] = True
+#             self.events["exit_early"] = True
+#         elif normalized == self.intervention_toggle_key:
+#             now = time.monotonic()
+#             if now - self._last_intervention_time < INTERVENTION_TOGGLE_COOLDOWN_S:
+#                 return
+#             self._last_intervention_time = now
+#             print(f"'{self.intervention_toggle_key}' key pressed. Toggling intervention mode...")
+#             self.events["toggle_intervention"] = True
+#         elif self.episode_success_key and normalized == self.episode_success_key:
+#             print(f"'{self.episode_success_key}' key pressed. Marking episode as success and exiting loop...")
+#             self.events["episode_outcome"] = EPISODE_SUCCESS
+#             self.events["exit_early"] = True
+#         elif self.episode_failure_key and normalized == self.episode_failure_key:
+#             print(f"'{self.episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
+#             self.events["episode_outcome"] = EPISODE_FAILURE
+#             self.events["exit_early"] = True
+
+###########################
+from pynput import keyboard
+# import threading
+# import time
+from typing import Optional
+# import logging
+
+class TTYKeyboardListener:
+    def __init__(self,
         events: dict[str, Any],
         intervention_toggle_key: str,
         episode_success_key: str | None,
         episode_failure_key: str | None,
-    ):
+        ):
         self.events = events
         self.intervention_toggle_key = intervention_toggle_key.lower()
         self.episode_success_key = episode_success_key.lower() if episode_success_key else None
         self.episode_failure_key = episode_failure_key.lower() if episode_failure_key else None
-        self._fd = sys.stdin.fileno()
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._old_attrs = None
+        self._listener: Optional[keyboard.Listener] = None
         self._last_intervention_time: float = 0.0
+        self._running = False
 
     def start(self):
-        self._old_attrs = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
-        self._thread = threading.Thread(target=self._run, name="tty-keyboard-listener", daemon=True)
-        self._thread.start()
+        """启动键盘监听器"""
+        self._running = True
+        self._listener = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release
+        )
+        self._listener.start()
 
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=0.5)
-        if self._old_attrs is not None:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
-            self._old_attrs = None
-
-    def _run(self):
-        while not self._stop_event.is_set():
-            ready, _, _ = select.select([self._fd], [], [], 0.1)
-            if not ready:
-                continue
-
-            try:
-                key = self._read_key()
-                if key is not None:
-                    self._handle_key(key)
-            except Exception as e:
-                logging.warning("TTY keyboard listener stopped after read error: %s", e)
-                self._stop_event.set()
-
-    def _read_key(self) -> str | None:
-        chunk = os.read(self._fd, 1)
-        if not chunk:
-            return None
-
-        if chunk == b"\x1b":
-            sequence = bytearray(chunk)
-            while True:
-                ready, _, _ = select.select([self._fd], [], [], 0.01)
-                if not ready:
-                    break
-                sequence.extend(os.read(self._fd, 1))
-                last_byte = bytes(sequence[-1:])
-                if len(sequence) >= 3 and last_byte in {b"A", b"B", b"C", b"D", b"~"}:
-                    break
-
-            sequence_bytes = bytes(sequence)
-            if sequence_bytes in {b"\x1b[C", b"\x1bOC"}:
-                return "RIGHT"
-            if sequence_bytes in {b"\x1b[D", b"\x1bOD"}:
-                return "LEFT"
-            if sequence_bytes == b"\x1b":
-                return "ESC"
-            return None
-
+    def _on_press(self, key):
+        """处理按键按下事件"""
         try:
-            return chunk.decode("utf-8", errors="ignore")
-        except Exception:
-            return None
+            # 处理普通字符键
+            if hasattr(key, 'char') and key.char is not None:
+                self._handle_key(key.char)
+            # 处理特殊键
+            else:
+                key_name = self._normalize_special_key(key)
+                if key_name:
+                    self._handle_key(key_name)
+        except Exception as e:
+            logging.warning("Error processing key press: %s", e)
+
+    def _on_release(self, key):
+        """处理按键释放事件"""
+        if key == keyboard.Key.esc and not self._running:
+            return False  # 停止监听器
+
+    def _normalize_special_key(self, key) -> Optional[str]:
+        """将 pynput 的特殊键转换为字符串"""
+        special_keys = {
+            keyboard.Key.right: "RIGHT",
+            keyboard.Key.left: "LEFT",
+            keyboard.Key.up: "UP",
+            keyboard.Key.down: "DOWN",
+            keyboard.Key.esc: "ESC",
+            keyboard.Key.enter: "ENTER",
+            keyboard.Key.backspace: "BACKSPACE",
+            keyboard.Key.tab: "TAB",
+            keyboard.Key.space: " ",
+            keyboard.Key.home: "HOME",
+            keyboard.Key.end: "END",
+            keyboard.Key.page_up: "PAGE_UP",
+            keyboard.Key.page_down: "PAGE_DOWN",
+            keyboard.Key.delete: "DELETE",
+            keyboard.Key.f1: "F1",
+            keyboard.Key.f2: "F2",
+            keyboard.Key.f3: "F3",
+            keyboard.Key.f4: "F4",
+            keyboard.Key.f5: "F5",
+            keyboard.Key.f6: "F6",
+            keyboard.Key.f7: "F7",
+            keyboard.Key.f8: "F8",
+            keyboard.Key.f9: "F9",
+            keyboard.Key.f10: "F10",
+            keyboard.Key.f11: "F11",
+            keyboard.Key.f12: "F12",
+        }
+        return special_keys.get(key)
 
     def _handle_key(self, key: str):
+        """处理按键事件（与原始代码相同）"""
         normalized = key.lower() if len(key) == 1 else key
+        
         if normalized == "RIGHT":
-            print("Right arrow key pressed. Exiting loop...")
+            logging.info("Right arrow key pressed. Exiting loop...")
             self.events["exit_early"] = True
         elif normalized == "LEFT":
-            print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+            logging.info("Left arrow key pressed. Exiting loop and rerecord the last episode...")
             self.events["rerecord_episode"] = True
             self.events["exit_early"] = True
         elif normalized == "ESC":
-            print("Escape key pressed. Stopping data recording...")
+            logging.info("Escape key pressed. Stopping data recording...")
             self.events["stop_recording"] = True
             self.events["exit_early"] = True
         elif normalized == self.intervention_toggle_key:
@@ -166,17 +280,27 @@ class TTYKeyboardListener:
             if now - self._last_intervention_time < INTERVENTION_TOGGLE_COOLDOWN_S:
                 return
             self._last_intervention_time = now
-            print(f"'{self.intervention_toggle_key}' key pressed. Toggling intervention mode...")
+            logging.info(f"'{self.intervention_toggle_key}' key pressed. Toggling intervention mode...")
             self.events["toggle_intervention"] = True
         elif self.episode_success_key and normalized == self.episode_success_key:
-            print(f"'{self.episode_success_key}' key pressed. Marking episode as success and exiting loop...")
+            logging.info(f"'{self.episode_success_key}' key pressed. Marking episode as success...")
             self.events["episode_outcome"] = EPISODE_SUCCESS
             self.events["exit_early"] = True
         elif self.episode_failure_key and normalized == self.episode_failure_key:
-            print(f"'{self.episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
+            logging.info(f"'{self.episode_failure_key}' key pressed. Marking episode as failure...")
             self.events["episode_outcome"] = EPISODE_FAILURE
             self.events["exit_early"] = True
 
+    def stop(self):
+        """停止键盘监听器"""
+        self._running = False
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
+
+    def is_alive(self) -> bool:
+        return self._listener is not None and self._listener.running
+    ##########################
 
 def predict_action(
     observation: dict[str, np.ndarray],

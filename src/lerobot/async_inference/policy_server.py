@@ -62,6 +62,10 @@ from .helpers import (
     raw_observation_to_observation,
 )
 
+RTC_INFERENCE_DELAY_KEY = "__rtc_inference_delay"
+RTC_PREV_CHUNK_LEFT_OVER_KEY = "__rtc_prev_chunk_left_over"
+RTC_EXECUTION_HORIZON_KEY = "__rtc_execution_horizon"
+
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
@@ -152,6 +156,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        rtc_config = getattr(policy_specs, "rtc_config", None)
+        if rtc_config is not None:
+            self.policy.config.rtc_config = rtc_config
+            if hasattr(self.policy, "init_rtc_processor"):
+                self.policy.init_rtc_processor()
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -311,19 +320,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
-        """Turn a chunk of actions into a list of TimedAction instances,
-        with the first action corresponding to t_0 and the rest corresponding to
-        t_0 + i*environment_dt for i in range(len(action_chunk))
-        """
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        original_action_chunk: list[torch.Tensor] | None = None,
+    ) -> list[TimedAction]:
+        """Turn a chunk of actions into timestamped action instances."""
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                original_action=None if original_action_chunk is None else original_action_chunk[i],
+            )
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+    def _get_action_chunk(self, observation: dict[str, torch.Tensor], **policy_kwargs) -> torch.Tensor:
+        """Get an action chunk from the policy."""
+        chunk = self.policy.predict_action_chunk(observation, **policy_kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -341,8 +358,23 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        raw_observation = dict(observation_t.get_observation())
+        inference_delay = raw_observation.pop(RTC_INFERENCE_DELAY_KEY, None)
+        prev_chunk_left_over = raw_observation.pop(RTC_PREV_CHUNK_LEFT_OVER_KEY, None)
+        execution_horizon = raw_observation.pop(RTC_EXECUTION_HORIZON_KEY, None)
+        if isinstance(prev_chunk_left_over, torch.Tensor):
+            prev_chunk_left_over = prev_chunk_left_over.to(self.device)
+
+        policy_kwargs = {}
+        if inference_delay is not None:
+            policy_kwargs["inference_delay"] = int(inference_delay)
+        if prev_chunk_left_over is not None:
+            policy_kwargs["prev_chunk_left_over"] = prev_chunk_left_over
+        if execution_horizon is not None:
+            policy_kwargs["execution_horizon"] = int(execution_horizon)
+
         observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
+            raw_observation,
             self.lerobot_features,
             self.policy_image_features,
         )
@@ -356,11 +388,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, **policy_kwargs)
+        original_action_tensor = action_tensor.squeeze(0).detach().cpu().clone()
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
+
+        # ========== 调试信息开始 ==========
+        print(f"[DEBUG] action_tensor.shape = {action_tensor.shape}")   # 预期 (B, chunk_size, action_dim)
+        print(f"[DEBUG] self.policy.config.action_dim = {self.policy.config.action_dim}")
+        # 如果 postprocessor 内部有 mean, std，也可打印（需要访问内部属性）
+        if hasattr(self.postprocessor, 'steps'):
+            for step in self.postprocessor.steps:
+                if hasattr(step, 'mean') and hasattr(step, 'std'):
+                    print(f"[DEBUG] step {step.__class__.__name__} mean len={len(step.mean)} std len={len(step.std)}")
+        # ========== 调试信息结束 ==========
 
         """4. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)
@@ -374,6 +417,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         for i in range(chunk_size):
             # Extract action at timestep i: (B, action_dim)
             single_action = action_tensor[:, i, :]
+            # 再打印每个 single_action 的形状
+            print(f"[DEBUG] single_action[{i}].shape = {single_action.shape}")  # 应该是 (B, action_dim)
             processed_action = self.postprocessor(single_action)
             processed_actions.append(processed_action)
 
@@ -385,7 +430,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            original_action_chunk=list(original_action_tensor),
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess

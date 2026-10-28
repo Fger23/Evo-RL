@@ -186,6 +186,7 @@ class RealSenseCamera(Camera):
             ) from e
 
         self._configure_capture_settings()
+        self._set_manual_exposure()
         self._start_read_thread()
 
         # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
@@ -318,6 +319,52 @@ class RealSenseCamera(Camera):
             else:
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
+
+    @check_if_not_connected
+    def _set_manual_exposure(self) -> None:
+        """Disables auto-exposure and applies a fixed exposure time on the color sensor.
+
+        Only runs when `exposure_us` is set in the config; otherwise the camera keeps
+        its default auto-exposure behavior. The exposure value is clamped to the range
+        supported by the device, and a warning is logged if it exceeds the frame period
+        (e.g. > 33333 us at 30 fps), since that would prevent reaching the requested fps.
+        """
+        exposure_us = self.config.exposure_us
+        if exposure_us is None:
+            return
+
+        if self.rs_profile is None:
+            raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
+
+        color_sensor = None
+        for sensor in self.rs_profile.get_device().query_sensors():
+            # D4xx devices (D435/D455) expose a dedicated "RGB Camera" sensor.
+            # On D405 the color stream is produced by the "Stereo Module" itself,
+            # so we fall back to the first sensor that supports the exposure option.
+            if sensor.get_info(rs.camera_info.name) == "RGB Camera" or (
+                color_sensor is None and sensor.supports(rs.option.exposure)
+            ):
+                color_sensor = sensor
+        if color_sensor is None:
+            raise RuntimeError(f"{self}: could not find the RGB sensor to set manual exposure.")
+
+        if self.fps is not None and exposure_us > 1_000_000 / self.fps:
+            logger.warning(
+                f"{self}: exposure_us={exposure_us} exceeds the frame period of "
+                f"{1_000_000 / self.fps:.0f}us at {self.fps}fps; the camera may not reach "
+                f"{self.fps}fps."
+            )
+
+        # Clamp to the exposure range supported by the device.
+        option_range = color_sensor.get_option_range(rs.option.exposure)
+        exposure_us = int(min(max(exposure_us, option_range.min), option_range.max))
+
+        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        color_sensor.set_option(rs.option.exposure, float(exposure_us))
+        logger.info(
+            f"{self}: auto-exposure disabled on sensor "
+            f"'{color_sensor.get_info(rs.camera_info.name)}', manual exposure set to {exposure_us}us."
+        )
 
     @check_if_not_connected
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
@@ -473,7 +520,9 @@ class RealSenseCamera(Camera):
         failure_count = 0
         while not self.stop_event.is_set():
             try:
+                t_start = time.perf_counter()
                 frame = self._read_from_hardware()
+                t_wait = time.perf_counter()
                 color_frame_raw = frame.get_color_frame()
                 color_frame = np.asanyarray(color_frame_raw.get_data())
                 processed_color_frame = self._postprocess_image(color_frame)
@@ -492,6 +541,17 @@ class RealSenseCamera(Camera):
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
                 failure_count = 0
+
+                t_end = time.perf_counter()
+                if t_end - t_start > 0.3:
+                    # Diagnostic: pinpoint where a slow iteration spent its time.
+                    # wait_for_frames=USB/SDK delivery, postprocess/lock=CPU starvation.
+                    logger.warning(
+                        f"{self}: slow read iteration {t_end - t_start:.2f}s "
+                        f"(wait_for_frames={t_wait - t_start:.2f}s, "
+                        f"postprocess={capture_time - t_wait:.2f}s, "
+                        f"store={t_end - capture_time:.2f}s)"
+                    )
 
             except DeviceNotConnectedError:
                 break
@@ -530,7 +590,7 @@ class RealSenseCamera(Camera):
 
     # NOTE(Steven): Missing implementation for depth for now
     @check_if_not_connected
-    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
+    def async_read(self, timeout_ms: float = 1000) -> NDArray[Any]:
         """
         Reads the latest available frame data (color) asynchronously.
 
@@ -556,10 +616,44 @@ class RealSenseCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
 
-        if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+        # Retry a few times before giving up: transient USB stalls or auto-exposure
+        # slowdowns should not kill an entire recording episode.
+        num_attempts = 3
+        for attempt in range(num_attempts):
+            if self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+                break
+            with self.frame_lock:
+                last_frame_age_ms = (
+                    (time.perf_counter() - self.latest_timestamp) * 1000
+                    if self.latest_timestamp is not None
+                    else -1
+                )
+            logger.warning(
+                f"{self}: no frame for {timeout_ms} ms (attempt {attempt + 1}/{num_attempts}); "
+                f"read thread alive: {self.thread.is_alive()}, "
+                f"last frame age: {last_frame_age_ms:.0f}ms. Retrying..."
+            )
+        else:
+            # Transient USB stalls (EMI, cable flex, motor-induced power dips) can
+            # stop frame delivery for a few seconds on robot rigs while the camera
+            # recovers afterwards. Rather than killing the recording, return the
+            # latest frame if it is still reasonably fresh; only raise if the camera
+            # looks dead.
+            with self.frame_lock:
+                stale_frame = self.latest_color_frame
+                stale_ts = self.latest_timestamp
+            stale_age = time.perf_counter() - stale_ts if stale_ts is not None else None
+            if stale_frame is not None and stale_age is not None and stale_age < 10.0:
+                logger.warning(
+                    f"{self}: no new frame for {timeout_ms * num_attempts} ms "
+                    f"(likely transient USB stall); returning stale frame "
+                    f"(age {stale_age:.2f}s) to keep recording alive."
+                )
+                return stale_frame
             raise TimeoutError(
-                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
-                f"Read thread alive: {self.thread.is_alive()}."
+                f"Timed out waiting for frame from camera {self} after "
+                f"{timeout_ms * num_attempts} ms. Read thread alive: {self.thread.is_alive()}, "
+                f"last frame age: {stale_age if stale_age is None else f'{stale_age:.2f}s'}."
             )
 
         with self.frame_lock:
